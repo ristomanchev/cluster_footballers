@@ -240,6 +240,10 @@ def build(season: str, workers: int = 4) -> pd.DataFrame:
     print(f"Saved {len(df)} players -> {out}")
     print(df.groupby("league")["player_id"].count().to_string())
     print("Position groups:\n" + df["pos_group"].value_counts(dropna=False).to_string())
+
+    from .model import save_embeddings  # local import: model depends on the saved CSV
+    print("Precomputing archetype map (t-SNE) ...", flush=True)
+    save_embeddings(season)
     return df
 
 

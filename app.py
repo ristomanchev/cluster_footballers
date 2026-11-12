@@ -10,7 +10,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from scout.config import FEATURE_GROUPS, FEATURES, LEAGUES, OUTFIELD_GROUPS, SHORT_LABELS
-from scout.model import FEATURE_COLS, ScoutModel, available_seasons, build_model, load_players
+from scout.model import (BASE_MIN_MINUTES, FEATURE_COLS, ScoutModel, available_seasons, build_model,
+                         embedding_path, load_players)
 
 # Reference palette (dataviz skill): categorical slots 1-2, muted context gray.
 BLUE, ORANGE, MUTED = "#2a78d6", "#eb6834", "#898781"
@@ -21,14 +22,30 @@ st.set_page_config(page_title="Prospect Comps", page_icon="⚽", layout="wide")
 
 
 # ---------------------------------------------------------------- data/model
+# The model is built once per (season, league adjustment) on every player with 300+ minutes;
+# the minutes slider only filters on top of it, so moving it costs no CPU.
 @st.cache_resource(show_spinner="Building model ...")
-def get_model(season: str, min_minutes: int, league_adjust: bool) -> ScoutModel:
-    return build_model(load_players(season), min_minutes=min_minutes, league_adjust=league_adjust)
+def get_model(season: str, league_adjust: bool) -> ScoutModel:
+    return build_model(load_players(season), min_minutes=BASE_MIN_MINUTES, league_adjust=league_adjust)
 
 
-@st.cache_data(show_spinner="Computing player map (t-SNE) ...")
-def get_embedding(season: str, min_minutes: int, league_adjust: bool) -> np.ndarray:
-    return get_model(season, min_minutes, league_adjust).compute_embedding()
+@st.cache_data(show_spinner="Loading player map ...")
+def get_embedding(season: str, league_adjust: bool) -> np.ndarray:
+    """Precomputed t-SNE coordinates aligned to the model's players (computed here only as a fallback)."""
+    P = get_model(season, league_adjust).players
+    path = embedding_path(season, league_adjust)
+    if path.exists():
+        xy = pd.read_csv(path).set_index("player_id").reindex(P["player_id"])
+        if xy.notna().all().all():
+            return xy[["x", "y"]].to_numpy()
+    return get_model(season, league_adjust).compute_embedding()
+
+
+@st.cache_data
+def get_labels(season: str, league_adjust: bool) -> dict[int, str]:
+    P = get_model(season, league_adjust).players
+    age = P["age"].round(0).astype("Int64").astype(str).replace("<NA>", "?")
+    return dict(zip(P["player_id"], P["name"] + " · " + P["team"] + " · " + age))
 
 
 seasons = available_seasons()
@@ -54,20 +71,17 @@ with st.sidebar:
         st.caption("Emphasise parts of the game when matching players.")
         weights = {g: st.slider(g, 0.0, 3.0, 1.0, 0.25, key=f"w_{g}") for g in FEATURE_GROUPS}
 
-model = get_model(season, min_minutes, league_adjust)
+model = get_model(season, league_adjust)
 P = model.players
-pool_mask = ((P["age"] >= pool_min_age) & P["league"].isin(pool_leagues)).to_numpy()
+LABELS = get_labels(season, league_adjust)
+active = (P["minutes"] >= min_minutes).to_numpy()
+pool_mask = active & ((P["age"] >= pool_min_age) & P["league"].isin(pool_leagues)).to_numpy()
 
 
 def fmt_value(v) -> str:
     if pd.isna(v):
         return "–"
     return f"€{v / 1e6:.1f}m" if v >= 1e6 else f"€{v / 1e3:.0f}k"
-
-
-def player_label(r) -> str:
-    age = f"{r.age:.0f}" if pd.notna(r.age) else "?"
-    return f"{r['name']} · {r.team} · {age}"
 
 
 # ---------------------------------------------------------------- charts
@@ -138,8 +152,7 @@ def player_detail(pid: int, key: str):
     # Row 2: pick a comp, then radar (wide) next to the raw numbers.
     pick, _ = st.columns([2, 3])
     opts = sims["player_id"].tolist()
-    comp = pick.selectbox("Compare against", opts, key=f"comp_{key}",
-                          format_func=lambda x: player_label(P[P["player_id"] == x].iloc[0]))
+    comp = pick.selectbox("Compare against", opts, key=f"comp_{key}", format_func=LABELS.get)
     left, right = st.columns([3, 2])
     with left:
         st.plotly_chart(radar(pid, comp), use_container_width=True, key=f"radar_{key}")
@@ -193,10 +206,9 @@ with tab_board:
         player_detail(int(board.iloc[rows[0]]["player_id"]), key="board")
 
 with tab_comps:
-    order = P.sort_values(["age", "minutes"], ascending=[True, False])
+    order = P[active].sort_values(["age", "minutes"], ascending=[True, False])
     options = order["player_id"].tolist()
-    pid = st.selectbox("Player (any age, any of the 10 leagues)", options,
-                       format_func=lambda x: player_label(P[P["player_id"] == x].iloc[0]),
+    pid = st.selectbox("Player (any age, any of the 10 leagues)", options, format_func=LABELS.get,
                        index=None, placeholder="Type a name ...")
     if pid is not None:
         player_detail(pid, key="comps")
@@ -204,20 +216,20 @@ with tab_comps:
         st.info("Pick any player to find who they most resemble in the comparison pool.")
 
 with tab_map:
-    emb = get_embedding(season, min_minutes, league_adjust)
+    emb = get_embedding(season, league_adjust)
     arch = model.archetypes
     c1, c2 = st.columns([1, 2])
     group = c1.selectbox("Position group", OUTFIELD_GROUPS, index=3)
     names = arch.loc[arch["pos_group"] == group, "archetype"].tolist()
     focus = c2.selectbox("Highlight archetype", names)
 
-    in_focus = (P["archetype"] == focus).to_numpy()
+    in_focus = (P["archetype"] == focus).to_numpy() & active
     young = (P["age"] < 22).to_numpy()
     hover = (P["name"] + "<br>" + P["team"] + " · " + P["league"] + "<br>Age "
              + P["age"].round(0).astype("Int64").astype(str) + " · " + P["archetype"]).to_numpy()
     fig = go.Figure()
     layers = [
-        (~in_focus, "Other players", MUTED, 5, 0.25),
+        (active & ~in_focus, "Other players", MUTED, 5, 0.25),
         (in_focus & ~young, f"{focus} (22+)", BLUE, 8, 0.85),
         (in_focus & young, f"{focus} (U21 prospects)", ORANGE, 10, 0.95),
     ]

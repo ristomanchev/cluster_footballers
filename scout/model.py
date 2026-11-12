@@ -13,6 +13,7 @@ from .config import (ARCHETYPES_PER_GROUP, FEATURES, LEAGUE_ADJUSTED, LEAGUE_STR
                      OUTFIELD_GROUPS, PROCESSED_DIR, RELIABLE_MINUTES, ROLES, TRAIT_NAMES)
 
 FEATURE_COLS = list(FEATURES)
+BASE_MIN_MINUTES = 300  # the model always includes everyone from here; the app filters on top
 Z_CLIP = 3.0
 SHRINK_ATTEMPTS = 10  # prior strength (attempts) for success-% shrinkage
 
@@ -32,7 +33,9 @@ def _shrink_pct(df: pd.DataFrame, pct_col: str, p90_col: str) -> pd.Series:
     succ = df[p90_col] * m90
     pct = df[pct_col] / 100
     att = np.where(pct > 0, succ / pct.where(pct > 0), np.nan)
-    prior = df.groupby("pos_group")[pct_col].transform("median") / 100
+    # Prior from reliable players only, so it doesn't change with the minutes filter.
+    reliable = df[df["minutes"] >= RELIABLE_MINUTES]
+    prior = df["pos_group"].map(reliable.groupby("pos_group")[pct_col].median()) / 100
     shrunk = (succ + SHRINK_ATTEMPTS * prior) / (att + SHRINK_ATTEMPTS)
     return (shrunk * 100).where(~np.isnan(att), df[pct_col])
 
@@ -112,10 +115,28 @@ def prepare_features(df: pd.DataFrame, min_minutes: int, league_adjust: bool) ->
         factor = df["league"].map(LEAGUE_STRENGTH).fillna(1.0)
         for c in LEAGUE_ADJUSTED:
             df[c] = df[c] * factor
-    # Impute gaps (e.g. xG/shot for players who barely shoot) with group medians.
+    # Impute gaps (e.g. xG/shot for players who barely shoot) with reliable players' group medians.
+    reliable = df[df["minutes"] >= RELIABLE_MINUTES]
     for c in FEATURE_COLS:
-        df[c] = df[c].fillna(df.groupby("pos_group")[c].transform("median")).fillna(df[c].median())
+        df[c] = (df[c].fillna(df["pos_group"].map(reliable.groupby("pos_group")[c].median()))
+                 .fillna(reliable[c].median()))
     return df
+
+
+def embedding_path(season: str, league_adjust: bool):
+    tag = "adj" if league_adjust else "raw"
+    return PROCESSED_DIR / f"embedding_{season.replace('/', '-')}_{tag}.csv"
+
+
+def save_embeddings(season: str) -> None:
+    """Precompute the t-SNE map (expensive) so the app never runs it on the server."""
+    df = load_players(season)
+    for adjust in (True, False):
+        m = build_model(df, min_minutes=BASE_MIN_MINUTES, league_adjust=adjust)
+        emb = m.compute_embedding()
+        out = pd.DataFrame({"player_id": m.players["player_id"], "x": emb[:, 0], "y": emb[:, 1]})
+        out.round(3).to_csv(embedding_path(season, adjust), index=False)
+        print(f"Saved map -> {embedding_path(season, adjust).name}")
 
 
 def _name_clusters(group: str, diffs: list[pd.Series]) -> dict[int, str]:
@@ -160,7 +181,7 @@ def build_model(df: pd.DataFrame, min_minutes: int = 600, league_adjust: bool = 
         if fit_mask.sum() < 10:
             continue
         k = ARCHETYPES_PER_GROUP[g]
-        km = KMeans(n_clusters=k, n_init=20, random_state=seed).fit(Z[fit_mask])
+        km = KMeans(n_clusters=k, n_init=10, random_state=seed).fit(Z[fit_mask])
         labels = km.predict(Z[gmask])
         group_mean, group_std = Z[fit_mask].mean(axis=0), Z[fit_mask].std(axis=0).clip(min=1e-6)
         # Centroid vs. group average, in within-group standard deviations.
